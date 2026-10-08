@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Shopee Affiliate Image Extractor",
+  "version": "1.0",
+  "description": "Extract product images from Shopee Affiliate dashboard",
+  "permissions": [],
+  "content_scripts": [
+    {
+      "matches": ["https://affiliate.shopee.co.id/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "48": "icon.png"
+  }
+}
