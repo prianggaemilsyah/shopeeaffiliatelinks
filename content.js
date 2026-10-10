@@ -7,17 +7,107 @@
         return new Promise(function(resolve) { setTimeout(resolve, ms); });
     }
 
+    function pickCol(row, names, exclude) {
+        var keys = Object.keys(row);
+        var i, k, key, name;
+        for (i = 0; i < names.length; i++) {
+            name = names[i].toLowerCase();
+            for (k = 0; k < keys.length; k++) {
+                if (keys[k].toLowerCase() === name) return row[keys[k]];
+            }
+        }
+        for (i = 0; i < names.length; i++) {
+            name = names[i].toLowerCase();
+            for (k = 0; k < keys.length; k++) {
+                key = keys[k].toLowerCase();
+                if (exclude && exclude.some(function(e) { return key.indexOf(e.toLowerCase()) !== -1; })) continue;
+                if (key.indexOf(name) !== -1) return row[keys[k]];
+            }
+        }
+        return '';
+    }
+
+    function cleanCell(v) {
+        if (v == null) return '';
+        v = String(v).trim();
+        if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') {
+            v = v.substring(1, v.length - 1).replace(/""/g, '"');
+        }
+        return v.trim();
+    }
+
+    function detectDelimiter(text) {
+        var end = text.length;
+        var inQ = false;
+        for (var i = 0; i < text.length; i++) {
+            var c = text.charAt(i);
+            if (c === '"') inQ = !inQ;
+            else if ((c === '\n' || c === '\r') && !inQ) { end = i; break; }
+        }
+        var line = text.substring(0, end);
+        var cands = ['\t', ';', ','];
+        var best = '\t';
+        var bestCount = -1;
+        for (var k = 0; k < cands.length; k++) {
+            var count = 0;
+            var q = false;
+            for (var j = 0; j < line.length; j++) {
+                var ch = line.charAt(j);
+                if (ch === '"') q = !q;
+                else if (ch === cands[k] && !q) count++;
+            }
+            if (count > bestCount) { bestCount = count; best = cands[k]; }
+        }
+        return best;
+    }
+
+    // Parser CSV yang menghormati tanda kutip (field bisa berisi koma/newline).
+    function parseDelimited(text, delim) {
+        var rows = [];
+        var row = [];
+        var field = '';
+        var inQuotes = false;
+        var i = 0;
+        var len = text.length;
+        while (i < len) {
+            var ch = text.charAt(i);
+            if (inQuotes) {
+                if (ch === '"') {
+                    if (text.charAt(i + 1) === '"') { field += '"'; i += 2; continue; }
+                    inQuotes = false; i++; continue;
+                }
+                field += ch; i++; continue;
+            }
+            if (ch === '"') { inQuotes = true; i++; continue; }
+            if (ch === delim) { row.push(field); field = ''; i++; continue; }
+            if (ch === '\r') { i++; continue; }
+            if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; i++; continue; }
+            field += ch; i++;
+        }
+        if (field.length > 0 || row.length > 0) {
+            row.push(field);
+            rows.push(row);
+        }
+        if (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0].trim() === '') {
+            rows.pop();
+        }
+        return rows;
+    }
+
     function parseCSV(text) {
-        var lines = text.trim().split('\n');
-        if (lines.length < 2) return [];
-        var headers = lines[0].split('\t');
+        text = text.replace(/^\uFEFF/, '');
+        var delim = detectDelimiter(text);
+        var rows = parseDelimited(text, delim);
+        if (rows.length < 2) return [];
+
+        var headers = rows[0].map(cleanCell);
         var results = [];
-        for (var i = 1; i < lines.length; i++) {
-            var cols = lines[i].split('\t');
-            if (cols.length < 2) continue;
+        for (var i = 1; i < rows.length; i++) {
+            var cols = rows[i];
+            if (cols.length === 1 && cols[0].trim() === '') continue;
             var row = {};
             for (var j = 0; j < headers.length; j++) {
-                row[headers[j].trim()] = (cols[j] || '').trim();
+                row[headers[j]] = cleanCell(cols[j]);
             }
             results.push(row);
         }
@@ -34,68 +124,28 @@
         return checkboxes.length;
     }
 
-    function waitForDownload(maxWait) {
-        return new Promise(function(resolve) {
-            var origCreateObjectURL = URL.createObjectURL;
-            var origClick = HTMLAnchorElement.prototype.click;
-            var captured = null;
-
-            URL.createObjectURL = function(blob) {
-                var url = origCreateObjectURL.call(URL, blob);
-                if (blob && blob.type && (blob.type.includes('csv') || blob.type.includes('text') || blob.type.includes('octet'))) {
-                    var reader = new FileReader();
-                    reader.onload = function() { captured = reader.result; };
-                    reader.readAsText(blob);
-                }
-                return url;
-            };
-
-            HTMLAnchorElement.prototype.click = function() {
-                if (this.download && !captured) {
-                    // Intercept download - don't actually download
-                }
-                return origClick.call(this);
-            };
-
-            var waited = 0;
-            var check = setInterval(function() {
-                waited += 300;
-                if (captured || waited >= maxWait) {
-                    clearInterval(check);
-                    URL.createObjectURL = origCreateObjectURL;
-                    HTMLAnchorElement.prototype.click = origClick;
-                    resolve(captured);
-                }
-            }, 300);
-        });
-    }
+    // CSV dikirim oleh inject.js (MAIN world) lewat postMessage karena override
+    // window.fetch / URL.createObjectURL di isolated world tidak mengenai halaman.
+    var pendingCSV = null;
+    window.addEventListener('message', function(e) {
+        var d = e.data;
+        if (d && d.__shopeeExtractorCSV === true && typeof d.text === 'string') {
+            pendingCSV = d.text;
+        }
+    });
 
     function waitForCSVDownload(maxWait) {
         return new Promise(function(resolve) {
-            var captured = null;
-            var origFetch = window.fetch;
-
-            window.fetch = function() {
-                return origFetch.apply(this, arguments).then(function(response) {
-                    var url = response.url || '';
-                    if (!captured && (url.includes('link') || url.includes('csv') || url.includes('export') || url.includes('share'))) {
-                        response.clone().text().then(function(t) {
-                            if (t.includes('\t') && t.includes('Link')) {
-                                captured = t;
-                            }
-                        });
-                    }
-                    return response;
-                });
-            };
+            pendingCSV = null;
+            try { window.postMessage({ __shopeeExtractorArm: true }, '*'); } catch (e) {}
 
             var waited = 0;
             var check = setInterval(function() {
                 waited += 300;
-                if (captured || waited >= maxWait) {
+                if (pendingCSV || waited >= maxWait) {
                     clearInterval(check);
-                    window.fetch = origFetch;
-                    resolve(captured);
+                    try { window.postMessage({ __shopeeExtractorDisarm: true }, '*'); } catch (e) {}
+                    resolve(pendingCSV);
                 }
             }, 300);
         });
@@ -139,11 +189,26 @@
     }
 
     function clickNextPage() {
-        var nextBtn = document.querySelector('[type="arrow-right"]')
-            || document.querySelector('span[style*="arrow-right"]');
+        var wrap = document.querySelector('.PaginationNoTotal__wrap');
+        if (wrap) {
+            var next = wrap.querySelector('.page-item.page-next');
+            if (next && !next.classList.contains('disabled')) { next.click(); return true; }
+
+            var active = wrap.querySelector('.page-item.page-page.active');
+            var current = active ? (parseInt(active.textContent.trim(), 10) || 1) : 1;
+            var pages = wrap.querySelectorAll('.page-item.page-page');
+            for (var i = 0; i < pages.length; i++) {
+                if ((parseInt(pages[i].textContent.trim(), 10) || 0) === current + 1) {
+                    pages[i].click();
+                    return true;
+                }
+            }
+            var more = wrap.querySelector('.page-item.page-more');
+            if (more) { more.click(); return true; }
+        }
+        var nextBtn = document.querySelector('[type="arrow-right"]:not(.page-prev):not(.disabled)')
+            || document.querySelector('span[style*="arrow-right"]:not(.page-prev):not(.disabled)');
         if (nextBtn) { nextBtn.click(); return true; }
-        var pages = document.querySelectorAll('.page-item');
-        if (pages.length > 0) { pages[pages.length - 1].click(); return true; }
         return false;
     }
 
@@ -220,11 +285,10 @@
     function setProgress(pct) { barEl.style.width = pct + '%'; }
 
     function hasNextPage() {
-        var arrowRight = document.querySelector('[type="arrow-right"]');
-        if (arrowRight) return true;
-        var spans = document.querySelectorAll('span[style*="arrow-right"]');
-        if (spans.length > 0) return true;
-        return false;
+        var next = document.querySelector('.PaginationNoTotal__wrap .page-item.page-next');
+        if (next) return !next.classList.contains('disabled');
+        var arrowRight = document.querySelector('[type="arrow-right"]:not(.page-prev):not(.disabled)');
+        return !!arrowRight;
     }
 
     async function clickBuatLinkMassal() {
@@ -245,47 +309,15 @@
             return null;
         }
 
-        var csvPromise = waitForCSVDownload(15000);
+        var csvPromise = waitForCSVDownload(20000);
         bulkBtn.click();
         setStatus('Klik "Buat Link Massal" | Menunggu popup...');
 
-        await sleep(1500);
-
-        // Cari tombol "Buat Link" di popup/modal
+        // Poll sampai tombol "Buat Link" di popup muncul
         var popupBtn = null;
-
-        // Cari di modal/popup yang visible
-        var modals = document.querySelectorAll('.ant-modal-wrap:not([style*="display: none"]), .ant-modal, [role="dialog"], .ant-popover:not(.ant-popover-hidden)');
-        for (var mo = 0; mo < modals.length; mo++) {
-            var btnsInModal = modals[mo].querySelectorAll('button');
-            for (var mb = 0; mb < btnsInModal.length; mb++) {
-                var txt = btnsInModal[mb].textContent.trim();
-                if (txt === 'Buat Link' || txt.includes('Buat Link')) {
-                    popupBtn = btnsInModal[mb];
-                    break;
-                }
-            }
-            if (popupBtn) break;
-        }
-
-        // Fallback: cari button.mkt-btn
-        if (!popupBtn) {
-            popupBtn = document.querySelector('button.mkt-btn');
-        }
-
-        // Fallback: cari semua button visible dengan text "Buat Link"
-        if (!popupBtn) {
-            var allBtns2 = document.querySelectorAll('button');
-            for (var b2 = 0; b2 < allBtns2.length; b2++) {
-                var btn = allBtns2[b2];
-                var txt2 = btn.textContent.trim();
-                var rect = btn.getBoundingClientRect();
-                var visible = rect.width > 0 && rect.height > 0 && btn.offsetParent !== null;
-                if (txt2 === 'Buat Link' && visible) {
-                    popupBtn = btn;
-                    break;
-                }
-            }
+        for (var w = 0; w < 40 && !popupBtn; w++) {
+            await sleep(200);
+            popupBtn = findBuatLinkButton();
         }
 
         if (popupBtn) {
@@ -298,6 +330,35 @@
 
         var csvText = await csvPromise;
         return csvText;
+    }
+
+    function findBuatLinkButton() {
+        // Cari di modal/popup yang visible
+        var modals = document.querySelectorAll('.ant-modal-wrap, .ant-modal, [role="dialog"], .ant-popover');
+        for (var mo = 0; mo < modals.length; mo++) {
+            var st = window.getComputedStyle(modals[mo]);
+            if (st.display === 'none' || st.visibility === 'hidden') continue;
+            var btnsInModal = modals[mo].querySelectorAll('button');
+            for (var mb = 0; mb < btnsInModal.length; mb++) {
+                if (btnsInModal[mb].textContent.trim() === 'Buat Link') {
+                    return btnsInModal[mb];
+                }
+            }
+        }
+
+        // Fallback: button.mkt-btn dengan text "Buat Link"
+        var mkt = document.querySelector('button.mkt-btn');
+        if (mkt && mkt.textContent.trim() === 'Buat Link') return mkt;
+
+        // Fallback: semua button visible dengan text "Buat Link"
+        var allBtns = document.querySelectorAll('button');
+        for (var b = 0; b < allBtns.length; b++) {
+            var btn = allBtns[b];
+            if (btn.textContent.trim() !== 'Buat Link') continue;
+            var rect = btn.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && btn.offsetParent !== null) return btn;
+        }
+        return null;
     }
 
     async function run() {
@@ -378,14 +439,14 @@
             if (csvText) {
                 var rows = parseCSV(csvText);
                 rows.forEach(function(row) {
-                    var pid = row['ID Produk'] || '';
+                    var pid = pickCol(row, ['ID Produk', 'Product ID', 'ProductId', 'ID']);
                     if (pid) {
                         allCSVData[pid] = {
-                            link_produk: row['Link Produk'] || '',
-                            link_komisi: row['Link Komisi Ekstra'] || '',
-                            nama_toko: row['Nama Toko'] || '',
-                            komisi_rate: row['Komisi hingga'] || '',
-                            komisi_rp: row['Komisi'] || ''
+                            link_produk: pickCol(row, ['Link Produk', 'Product Link', 'Link Product']),
+                            link_komisi: pickCol(row, ['Link Komisi Ekstra', 'Link Komisi', 'Link Afiliasi', 'Affiliate Link', 'Link Affiliate']),
+                            nama_toko: pickCol(row, ['Nama Toko', 'Shop Name', 'Nama Shop']),
+                            komisi_rate: pickCol(row, ['Komisi hingga', 'Komisi Rate', 'Rate Komisi']),
+                            komisi_rp: pickCol(row, ['Komisi'], ['hingga', 'rate', '%', 'ekstra'])
                         };
                     }
                 });
