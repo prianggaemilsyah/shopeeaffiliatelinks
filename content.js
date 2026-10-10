@@ -114,14 +114,31 @@
         return results;
     }
 
-    function clickAllCheckboxes() {
-        var checkboxes = document.querySelectorAll('.product-offer-item .ant-checkbox-input');
-        checkboxes.forEach(function(cb) {
-            if (!cb.checked) {
-                cb.click();
+    async function clickAllCheckboxes() {
+        var total = 0;
+        var pass, i, cb;
+        // Beberapa pass: klik ulang setiap checkbox yang belum tercentang.
+        // Re-query DOM tiap kali agar tidak memakai node yang sudah di-render ulang.
+        for (pass = 0; pass < 5; pass++) {
+            total = document.querySelectorAll('.product-offer-item .ant-checkbox-input').length;
+            var clickedAny = false;
+            for (i = 0; i < total; i++) {
+                cb = document.querySelectorAll('.product-offer-item .ant-checkbox-input')[i];
+                if (cb && !cb.checked) {
+                    cb.click();
+                    clickedAny = true;
+                    await sleep(40);
+                }
             }
+            if (!clickedAny) break;
+            await sleep(300);
+        }
+
+        var unchecked = 0;
+        document.querySelectorAll('.product-offer-item .ant-checkbox-input').forEach(function(x) {
+            if (!x.checked) unchecked++;
         });
-        return checkboxes.length;
+        return { total: total, unchecked: unchecked };
     }
 
     // CSV dikirim oleh inject.js (MAIN world) lewat postMessage karena override
@@ -379,7 +396,7 @@
             setProgress(Math.min(100, Math.round(total / target * 100)));
             setStatus('Halaman ' + page + ' | Centang checkbox...');
 
-            var checked = clickAllCheckboxes();
+            var chk = await clickAllCheckboxes();
             await sleep(500);
 
             // Extract gambar dari DOM
@@ -396,7 +413,7 @@
 
             total = Object.keys(allProducts).length;
             setProgress(Math.min(100, Math.round(total / target * 100)));
-            setStatus('Halaman ' + page + ' | ' + total + '/' + target + ' (+' + addedThisPage + ') | checkbox: ' + checked);
+            setStatus('Halaman ' + page + ' | ' + total + '/' + target + ' (+' + addedThisPage + ') | checkbox: ' + chk.total + (chk.unchecked ? ' (belum: ' + chk.unchecked + ')' : ''));
 
             // Cek apakah sudah cukup atau halaman terakhir
             var reachedTarget = Object.keys(allProducts).length >= target;
@@ -428,31 +445,46 @@
             if (page > 200) { setStatus('Safety limit'); break; }
         }
 
-        // Phase 2: Di halaman terakhir, klik "Buat Link Massal" untuk generate affiliate links
+        // Phase 2: Di halaman terakhir, klik "Buat Link Massal" untuk generate affiliate links.
+        // Dicoba beberapa kali supaya produk yang gagal tercentang/ter-generate tetap dapat link.
+        var csvRowsTotal = 0;
         if (!stopped) {
-            // Centang ulang semua checkbox di halaman ini
-            clickAllCheckboxes();
-            await sleep(500);
+            var maxAttempts = 2;
+            for (var attempt = 1; attempt <= maxAttempts && !stopped; attempt++) {
+                await clickAllCheckboxes();
+                await sleep(800);
 
-            var csvText = await clickBuatLinkMassal();
+                var csvText = await clickBuatLinkMassal();
 
-            if (csvText) {
-                var rows = parseCSV(csvText);
-                rows.forEach(function(row) {
-                    var pid = pickCol(row, ['ID Produk', 'Product ID', 'ProductId', 'ID']);
-                    if (pid) {
-                        allCSVData[pid] = {
-                            link_produk: pickCol(row, ['Link Produk', 'Product Link', 'Link Product']),
-                            link_komisi: pickCol(row, ['Link Komisi Ekstra', 'Link Komisi', 'Link Afiliasi', 'Affiliate Link', 'Link Affiliate']),
-                            nama_toko: pickCol(row, ['Nama Toko', 'Shop Name', 'Nama Shop']),
-                            komisi_rate: pickCol(row, ['Komisi hingga', 'Komisi Rate', 'Rate Komisi']),
-                            komisi_rp: pickCol(row, ['Komisi'], ['hingga', 'rate', '%', 'ekstra'])
-                        };
-                    }
+                if (csvText) {
+                    var rows = parseCSV(csvText);
+                    csvRowsTotal = rows.length;
+                    rows.forEach(function(row) {
+                        var pid = pickCol(row, ['ID Produk', 'Product ID', 'ProductId', 'ID']);
+                        if (pid) {
+                            allCSVData[pid] = {
+                                link_produk: pickCol(row, ['Link Produk', 'Product Link', 'Link Product']),
+                                link_komisi: pickCol(row, ['Link Komisi Ekstra', 'Link Komisi', 'Link Afiliasi', 'Affiliate Link', 'Link Affiliate']),
+                                nama_toko: pickCol(row, ['Nama Toko', 'Shop Name', 'Nama Shop']),
+                                komisi_rate: pickCol(row, ['Komisi hingga', 'Komisi Rate', 'Rate Komisi']),
+                                komisi_rp: pickCol(row, ['Komisi'], ['hingga', 'rate', '%', 'ekstra'])
+                            };
+                        }
+                    });
+                    setStatus('CSV: ' + rows.length + ' baris (percobaan ' + attempt + ')');
+                } else {
+                    setStatus('CSV tidak tertangkap (percobaan ' + attempt + ')');
+                }
+
+                var missingCount = 0;
+                Object.keys(allProducts).forEach(function(pid) {
+                    if (!allCSVData[pid] || !allCSVData[pid].link_komisi) missingCount++;
                 });
-                setStatus('CSV: ' + rows.length + ' produk dengan Link Komisi');
-            } else {
-                setStatus('CSV tidak tertangkap');
+                if (missingCount === 0) break;
+                if (attempt < maxAttempts) {
+                    setStatus(missingCount + ' produk belum dapat link, coba ulang...');
+                    await sleep(1500);
+                }
             }
         }
 
@@ -475,10 +507,14 @@
         if (finalCount > 0) {
             var arr = Object.values(allProducts);
             var withLink = arr.filter(function(p) { return p.link_komisi; }).length;
+            var missing = arr.filter(function(p) { return !p.link_komisi; })
+                .map(function(p) { return p.product_id; });
             var output = {
                 extracted_at: new Date().toISOString(),
                 total_products: arr.length,
                 with_affiliate_link: withLink,
+                csv_rows: csvRowsTotal,
+                missing_links: missing,
                 pages_scraped: page,
                 products: arr
             };
